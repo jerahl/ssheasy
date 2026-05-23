@@ -25,10 +25,38 @@ Use `/connect?host=HOST&port=PORT&user=USER&password=PASSWORD` for initiating co
 | `pk`           | Private key (as string, for key auth)       | –            |
 | `webauthnKey`  | WebAuthn key ID (for WebAuthn auth)         | -1           |
 | `connect`      | Whether to auto-connect (`"true"`/`"false"`) | "true"      |
+| `embed`        | Embed mode (`"1"` strips chrome for iframing) | -          |
+| `readonly`     | Drop user keystrokes except Ctrl-C (`"1"`)  | -            |
+| `origin`       | Allowed parent origin for postMessage       | -            |
+| `cmd`          | Base64-encoded command to run on connect    | -            |
 
 *Notes:*
 - `host` is mandatory if `connect` is `"true"` (or not provided).
 - If `connect` is `"false"`, the connection will not auto-initiate, but the provided connection data will be filled in the connection form.
+
+### Embedding ssheasy in another web app
+
+`embed=1` hides the navbar, file browser, history list, and footer so ssheasy
+fits inside an iframe. The host/port/user fields stay visible (read-only) when
+credentials are missing so an operator can type their password — useful when
+the parent app supplies the host/user from context but not the secret.
+
+Set `origin` to the parent window's origin to enable a postMessage bridge:
+
+| Direction         | Message                                     | Meaning |
+|-------------------|---------------------------------------------|---------|
+| iframe → parent   | `{type:"status", state:"loaded"}`           | Page loaded, ready for messages |
+| iframe → parent   | `{type:"status", state:"connected", msg}`   | SSH session is up |
+| iframe → parent   | `{type:"status", state:"disconnected", msg}`| Connection dropped |
+| iframe → parent   | `{type:"status", state:"error", msg}`       | Error shown to user |
+| iframe → parent   | `{type:"pong"}`                             | Reply to a `ping` |
+| parent → iframe   | `{type:"run", cmd:"show version"}`          | Run command (bypasses `readonly`) |
+| parent → iframe   | `{type:"interrupt"}`                        | Send Ctrl-C |
+| parent → iframe   | `{type:"ping"}`                             | Liveness check |
+
+Messages from origins other than `origin` are ignored. Configure nginx
+`frame-ancestors` (see `nginx/nginx.conf`) so browsers will only embed
+ssheasy from the parent app's origin.
 
 
 ## Testing

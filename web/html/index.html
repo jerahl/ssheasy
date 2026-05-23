@@ -23,6 +23,169 @@
   
     <script src="wasm_exec.js"></script>
     <script type="text/javascript">
+// --- Embed bridge: lets ssheasy be iframed by a parent dashboard (e.g. Zabbix
+// switches "Macros · CLI" tab). Activated by the embed=1 URL parameter on
+// /connect. See README for the postMessage protocol.
+(function setupEmbedBridge() {
+  var url;
+  try { url = new URL(window.location.href); } catch (e) { return; }
+  if (url.pathname !== "/connect") return;
+  var p = url.searchParams;
+  var enabled = p.get("embed") === "1";
+  if (!enabled) return;
+
+  var allowedOrigin = p.get("origin") || "";
+  var readonly = p.get("readonly") === "1";
+  var initialCmd = "";
+  var initialCmdRaw = p.get("cmd") || "";
+  if (initialCmdRaw) {
+    try { initialCmd = atob(initialCmdRaw); }
+    catch (e) { console.warn("embed: invalid base64 cmd"); }
+  }
+
+  window.__embed = {
+    enabled: true,
+    readonly: readonly,
+    origin: allowedOrigin,
+    initialCmd: initialCmd,
+    keyCb: null,
+  };
+  document.documentElement.classList.add("embed");
+
+  function post(msg) {
+    if (!allowedOrigin || !window.parent || window.parent === window) return;
+    try { window.parent.postMessage(msg, allowedOrigin); } catch (e) {}
+  }
+  window.__embed.post = post;
+
+  // Wrap term.onData (called by the WASM client once we have an SSH session)
+  // so we can: capture the stdin-write callback, filter keystrokes in
+  // readonly mode, and replay commands sent via postMessage.
+  function wrapOnData() {
+    if (!window.term || typeof window.term.onData !== "function") return false;
+    if (window.term.__embedWrapped) return true;
+    var orig = window.term.onData.bind(window.term);
+    window.term.onData = function(cb) {
+      window.__embed.keyCb = cb;
+      return orig(function(data) {
+        if (window.__embed.readonly) {
+          // Allow Ctrl-C only; drop everything else from the user.
+          if (data !== "\x03") return;
+        }
+        cb(data);
+      });
+    };
+    window.term.__embedWrapped = true;
+    return true;
+  }
+  // Try immediately and on a short interval until xterm exists.
+  if (!wrapOnData()) {
+    var iv = setInterval(function() { if (wrapOnData()) clearInterval(iv); }, 50);
+  }
+
+  // Programmatic command runner — bypasses the readonly filter.
+  window.sshRun = function(cmd) {
+    if (!window.__embed.keyCb) {
+      console.warn("embed: sshRun before SSH session is up");
+      return false;
+    }
+    if (!cmd.endsWith("\n") && !cmd.endsWith("\r")) cmd += "\n";
+    window.__embed.keyCb(cmd);
+    return true;
+  };
+
+  // Status reporting: wrap existing globals once they are defined.
+  function wrapStatus() {
+    if (typeof window.connected === "function" && !window.connected.__embedWrapped) {
+      var origConnected = window.connected;
+      window.connected = function(status, home) {
+        var r = origConnected.apply(this, arguments);
+        post({ type: "status", state: "connected", msg: status });
+        if (window.__embed.initialCmd) {
+          setTimeout(function() { window.sshRun(window.__embed.initialCmd); }, 250);
+        }
+        return r;
+      };
+      window.connected.__embedWrapped = true;
+    }
+    if (typeof window.showReconnect === "function" && !window.showReconnect.__embedWrapped) {
+      var origReconnect = window.showReconnect;
+      window.showReconnect = function(errMsg) {
+        post({ type: "status", state: "disconnected", msg: errMsg });
+        return origReconnect.apply(this, arguments);
+      };
+      window.showReconnect.__embedWrapped = true;
+    }
+    if (typeof window.showErr === "function" && !window.showErr.__embedWrapped) {
+      var origErr = window.showErr;
+      window.showErr = function(msg) {
+        post({ type: "status", state: "error", msg: msg });
+        return origErr.apply(this, arguments);
+      };
+      window.showErr.__embedWrapped = true;
+    }
+  }
+  var sIv = setInterval(function() {
+    wrapStatus();
+    if (window.connected && window.connected.__embedWrapped &&
+        window.showReconnect && window.showReconnect.__embedWrapped) {
+      clearInterval(sIv);
+    }
+  }, 50);
+
+  // Inbound postMessage handler.
+  window.addEventListener("message", function(ev) {
+    if (allowedOrigin && ev.origin !== allowedOrigin) return;
+    var d = ev.data;
+    if (!d || typeof d !== "object") return;
+    if (d.type === "run" && typeof d.cmd === "string") {
+      window.sshRun(d.cmd);
+    } else if (d.type === "interrupt") {
+      if (window.__embed.keyCb) window.__embed.keyCb("\x03");
+    } else if (d.type === "ping") {
+      post({ type: "pong" });
+    }
+  });
+
+  // Tell parent we are ready (it can then postMessage runs queued up).
+  document.addEventListener("DOMContentLoaded", function() {
+    post({ type: "status", state: "loaded" });
+  });
+})();
+    </script>
+    <style>
+      /* Embed mode: strip everything except the terminal. The parent
+         dashboard provides the surrounding chrome (tab nav, preset
+         command buttons, reconnect button, session timer). */
+      html.embed body { background: #000; }
+      html.embed #headerRow,
+      html.embed #footerRow,
+      html.embed #fileBrowserRow,
+      html.embed #historyListContainer,
+      html.embed #toggleFileBrowserBtn,
+      html.embed #conInf {
+        display: none !important;
+      }
+      /* When credentials are missing, keep #conPan visible but show only
+         the password / pk fields and the Connect button. host/user/port
+         are passed via URL params and rendered read-only above. */
+      html.embed #conPan .col-2,
+      html.embed #conPan #bypassProxyInp,
+      html.embed #conPan label[for="webauthnKeySelect"],
+      html.embed #conPan #webauthnKeySelect,
+      html.embed #conPan a[href="webauthn.html"],
+      html.embed #conPan button[onclick*="showCreatePublicKey"] {
+        display: none !important;
+      }
+      html.embed #conPan #usrInp,
+      html.embed #conPan #hostInp,
+      html.embed #conPan #portInp {
+        pointer-events: none;
+        opacity: 0.7;
+      }
+      html.embed #mainContentArea { height: 100vh !important; }
+    </style>
+    <script type="text/javascript">
 function fetchAndInstantiate(url, importObject) {
   return fetch(url).then(response =>
     response.arrayBuffer()
