@@ -30,6 +30,7 @@ Use `/connect?host=HOST&port=PORT&user=USER&password=PASSWORD` for initiating co
 | `origin`       | Allowed parent origin for postMessage       | -            |
 | `cmd`          | Base64-encoded command to run on connect    | -            |
 | `epassword`    | AES-256-GCM encrypted password (see below)  | -            |
+| `debug`        | `"1"` logs to console / screen / postMessage | -           |
 
 *Notes:*
 - `host` is mandatory if `connect` is `"true"` (or not provided).
@@ -48,6 +49,22 @@ There are two ways to embed ssheasy in an iframe:
    `/terminal?host=10.0.0.5&user=netops&embed=1&readonly=1&origin=https://zabbix.example.com`
 2. **`/connect?...&embed=1`** — the full index page with its chrome hidden via
    CSS. Use this only if you also need the file browser/SFTP UI in the iframe.
+
+> **Note:** `terminal.html`, `sheasy-config.js`, and the nginx changes are
+> baked into the web image at build time. After pulling these changes you must
+> rebuild, e.g. `docker-compose up --build` (a plain restart serves the old
+> image and `/terminal` + `/sheasy-config.js` will 404).
+
+#### Debugging
+
+Add `debug=1` to either embed URL to trace startup. It logs (with a
+`[ssheasy]` prefix) to the browser console, draws dim `[dbg]` lines in the
+terminal itself, and — when `origin` is set — posts `{type:"debug", msg}` to
+the parent window. It reports parsed parameters, whether `xterm`/`wasm_exec`/
+`sheasy-config.js` loaded, the `/main.wasm` fetch status, each WASM callback
+(`connected`, `showErr`, `showReconnect`, fingerprint prompt), and every
+inbound/outbound postMessage. If the iframe is blank, a fatal startup error is
+also written to a visible `<pre>` so you see it without opening devtools.
 
 #### Full index page embed (`embed=1`)
 

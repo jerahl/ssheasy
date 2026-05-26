@@ -40,6 +40,7 @@
 
   var allowedOrigin = p.get("origin") || "";
   var readonly = p.get("readonly") === "1";
+  var debug = p.get("debug") === "1";
   var initialCmd = "";
   var initialCmdRaw = p.get("cmd") || "";
   if (initialCmdRaw) {
@@ -50,6 +51,7 @@
   window.__embed = {
     enabled: true,
     readonly: readonly,
+    debug: debug,
     origin: allowedOrigin,
     initialCmd: initialCmd,
     keyCb: null,
@@ -61,6 +63,24 @@
     try { window.parent.postMessage(msg, allowedOrigin); } catch (e) {}
   }
   window.__embed.post = post;
+
+  function dbg() {
+    if (!debug) return;
+    var args = Array.prototype.slice.call(arguments);
+    try { console.log.apply(console, ["[ssheasy-embed]"].concat(args)); } catch (e) {}
+    var msg = args.map(function (a) {
+      try { return typeof a === "object" ? JSON.stringify(a) : String(a); } catch (e) { return String(a); }
+    }).join(" ");
+    post({ type: "debug", msg: msg });
+  }
+  window.__embed.dbg = dbg;
+  dbg("embed bridge active:", {
+    readonly: readonly, origin: allowedOrigin || "(none)",
+    cmd: initialCmd || "(none)",
+    sheasyKey: (typeof window.SSHEASY_KEY === "undefined")
+      ? "(sheasy-config.js missing/404)"
+      : (window.SSHEASY_KEY ? "set" : "null")
+  });
 
   // Wrap term.onData (called by the WASM client once we have an SSH session)
   // so we can: capture the stdin-write callback, filter keystrokes in
@@ -142,9 +162,13 @@
 
   // Inbound postMessage handler.
   window.addEventListener("message", function(ev) {
-    if (allowedOrigin && ev.origin !== allowedOrigin) return;
+    if (allowedOrigin && ev.origin !== allowedOrigin) {
+      dbg("ignored message from origin:", ev.origin, "(expected " + allowedOrigin + ")");
+      return;
+    }
     var d = ev.data;
     if (!d || typeof d !== "object") return;
+    dbg("message in:", d.type);
     if (d.type === "run" && typeof d.cmd === "string") {
       window.sshRun(d.cmd);
     } else if (d.type === "interrupt") {
