@@ -37,10 +37,12 @@ Use `/connect?host=HOST&port=PORT&user=USER&password=PASSWORD` for initiating co
 
 ### Embedding ssheasy in another web app
 
-`embed=1` hides the navbar, file browser, history list, and footer so ssheasy
-fits inside an iframe. The host/port/user fields stay visible (read-only) when
-credentials are missing so an operator can type their password — useful when
-the parent app supplies the host/user from context but not the secret.
+`embed=1` hides the navbar, connection form, file browser, history list, and
+footer so ssheasy fits inside an iframe. When the URL omits the `user` or
+`password`, ssheasy prompts for them directly in the terminal (password input
+is masked, Ctrl-C cancels) — useful when the parent app supplies the host from
+context but not the secret. This terminal prompting also works outside embed
+mode for any `/connect` URL with a blank user or password.
 
 Set `origin` to the parent window's origin to enable a postMessage bridge:
 

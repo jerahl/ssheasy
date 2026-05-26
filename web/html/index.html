@@ -69,6 +69,9 @@
     if (!window.term || typeof window.term.onData !== "function") return false;
     if (window.term.__embedWrapped) return true;
     var orig = window.term.onData.bind(window.term);
+    // Expose the unwrapped onData so pre-connection terminal prompts (login /
+    // password) can read input even when readonly mode is active.
+    window.__embed.rawOnData = orig;
     window.term.onData = function(cb) {
       window.__embed.keyCb = cb;
       return orig(function(data) {
@@ -170,23 +173,9 @@
       html.embed #conInf {
         display: none !important;
       }
-      /* When credentials are missing, keep #conPan visible but show only
-         the password / pk fields and the Connect button. host/user/port
-         are passed via URL params and rendered read-only above. */
-      html.embed #conPan .col-2,
-      html.embed #conPan #bypassProxyInp,
-      html.embed #conPan label[for="webauthnKeySelect"],
-      html.embed #conPan #webauthnKeySelect,
-      html.embed #conPan a[href="webauthn.html"],
-      html.embed #conPan button[onclick*="showCreatePublicKey"] {
-        display: none !important;
-      }
-      html.embed #conPan #usrInp,
-      html.embed #conPan #hostInp,
-      html.embed #conPan #portInp {
-        pointer-events: none;
-        opacity: 0.7;
-      }
+      /* Missing user/password are collected via terminal prompts (see
+         termPrompt), so the connection form is hidden entirely. */
+      html.embed #conPan { display: none !important; }
       html.embed #mainContentArea { height: 100vh !important; }
     </style>
     <script type="text/javascript">
@@ -410,6 +399,46 @@ window.onload = function() {
     return new TextDecoder().decode(pt);
   }
 
+  // Read a line of input directly from the xterm terminal. Returns the typed
+  // string on Enter, or null if the user pressed Ctrl-C. opts.mask hides input
+  // (for passwords). Uses the unwrapped onData so it works in readonly embeds.
+  function termPrompt(label, opts) {
+    opts = opts || {};
+    return new Promise(function(resolve) {
+      term.write("\r\n" + label);
+      term.focus();
+      var buf = "";
+      var register = (window.__embed && window.__embed.rawOnData)
+        ? window.__embed.rawOnData
+        : term.onData.bind(term);
+      var disp = register(function(data) {
+        for (var i = 0; i < data.length; i++) {
+          var ch = data[i];
+          var code = data.charCodeAt(i);
+          if (ch === "\r" || ch === "\n") {
+            term.write("\r\n");
+            disp.dispose();
+            resolve(buf);
+            return;
+          } else if (code === 127 || code === 8) { // Backspace / DEL
+            if (buf.length > 0) {
+              buf = buf.slice(0, -1);
+              if (!opts.mask) term.write("\b \b");
+            }
+          } else if (code === 3) {                  // Ctrl-C
+            term.write("^C\r\n");
+            disp.dispose();
+            resolve(null);
+            return;
+          } else if (code >= 32) {                  // printable
+            buf += ch;
+            term.write(opts.mask ? "*" : ch);
+          }
+        }
+      });
+    });
+  }
+
   function handleConnectFromQuery() {
     const url = new URL(window.location.href);
     if (url.pathname === "/connect") {
@@ -431,8 +460,26 @@ window.onload = function() {
       if (pk) $('#pkInp').val(pk);
       if (webauthnKey != -1) $('#webauthnKeySelect').val(webauthnKey);
 
-      const doInit = function(pw) {
-        if (pw) $('#passInp').val(pw);
+      // Prompt in the terminal for any missing user/password, then connect.
+      const collectAndConnect = async function(pw) {
+        let u = user;
+        let p = pw;
+        const needUser = !u;
+        const needPass = !p && !pk && webauthnKey == -1;
+        if (needUser || needPass) {
+          term.reset();
+          term.write("Connecting to " + host + "...\r\n");
+        }
+        if (needUser) {
+          u = await termPrompt("login as: ", {});
+          if (!u) { showErr("Login cancelled."); return; }
+          $('#usrInp').val(u);
+        }
+        if (needPass) {
+          p = await termPrompt(u + "@" + host + "'s password: ", { mask: true });
+          if (p === null) { showErr("Login cancelled."); return; }
+        }
+        if (p) $('#passInp').val(p);
         showMsg('Connecting...');
         $('#conBtn').prop('disabled', true);
         initConnection(
@@ -440,8 +487,8 @@ window.onload = function() {
           term.cols,
           host,
           Number(port),
-          user,
-          pw || "",
+          u,
+          p || "",
           pk,
           $('#bypassProxyInp').is(':checked'),
           false,
@@ -452,11 +499,13 @@ window.onload = function() {
       if (host && port && doConnect === "true") {
         if (epassword && !password) {
           showMsg('Decrypting credentials...');
-          decryptEPassword(epassword).then(doInit).catch(function(err) {
+          decryptEPassword(epassword).then(function(pw) {
+            collectAndConnect(pw);
+          }).catch(function(err) {
             showErr("Failed to decrypt epassword: " + (err.message || err));
           });
         } else {
-          doInit(password);
+          collectAndConnect(password);
         }
       } else {
         if(doConnect == "true") {
