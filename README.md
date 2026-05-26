@@ -29,6 +29,7 @@ Use `/connect?host=HOST&port=PORT&user=USER&password=PASSWORD` for initiating co
 | `readonly`     | Drop user keystrokes except Ctrl-C (`"1"`)  | -            |
 | `origin`       | Allowed parent origin for postMessage       | -            |
 | `cmd`          | Base64-encoded command to run on connect    | -            |
+| `epassword`    | AES-256-GCM encrypted password (see below)  | -            |
 
 *Notes:*
 - `host` is mandatory if `connect` is `"true"` (or not provided).
@@ -57,6 +58,50 @@ Set `origin` to the parent window's origin to enable a postMessage bridge:
 Messages from origins other than `origin` are ignored. Configure nginx
 `frame-ancestors` (see `nginx/nginx.conf`) so browsers will only embed
 ssheasy from the parent app's origin.
+
+### Encrypted password parameter (`epassword`)
+
+Putting a plaintext `password=` in the URL leaks it to browser history,
+referrer headers, server logs, and screenshots. `epassword` accepts an
+AES-256-GCM ciphertext instead. Both ssheasy and the parent app share a
+32-byte symmetric key; the URL only contains the ciphertext.
+
+**Threat model:** this protects against URL leakage. It does **not**
+protect against an attacker who can fetch `/sheasy-config.js` from
+ssheasy's origin — the key is served to the browser so the WASM client
+can decrypt. Pair with `nginx` access controls and `frame-ancestors`.
+
+**Setup:**
+
+1. Generate a key once and store it in both places:
+   ```
+   openssl rand -hex 32
+   ```
+2. Set `SSHEASY_DECRYPT_KEY` on the ssheasy `web` container (see
+   `docker-compose.yaml`). The entrypoint writes it to
+   `/usr/share/nginx/html/sheasy-config.js` on container start.
+3. Configure the same key on the parent app side.
+
+**Wire format:** `epassword = base64( iv(12 bytes) || ciphertext || tag(16 bytes) )`.
+Standard or URL-safe base64 both work.
+
+**PHP (Zabbix side):**
+```php
+$key = hex2bin(getenv('SSHEASY_DECRYPT_KEY')); // 32 raw bytes
+$iv  = random_bytes(12);
+$tag = '';
+$ct  = openssl_encrypt(
+    $password, 'aes-256-gcm', $key, OPENSSL_RAW_DATA, $iv, $tag
+);
+$epassword = rtrim(strtr(base64_encode($iv . $ct . $tag), '+/', '-_'), '=');
+$url = "/connect?host=$host&user=$user&epassword=$epassword&embed=1";
+```
+
+**Browser side:** ssheasy decodes the parameter, splits off the IV and
+tag, and decrypts via `crypto.subtle.decrypt({name:'AES-GCM', iv}, ...)`
+before calling `initConnection`. If `SSHEASY_DECRYPT_KEY` is unset or
+decryption fails, the user sees an error and the connection is not
+attempted.
 
 
 ## Testing

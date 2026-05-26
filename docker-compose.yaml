@@ -10,6 +10,12 @@ services:
     restart: always
     ports:
       - 8080:80
+    environment:
+      # 32-byte (64 hex char) shared key for AES-256-GCM decryption of the
+      # optional `epassword` URL parameter. Generate with: openssl rand -hex 32
+      # The same value must be configured in the parent app (e.g. Zabbix)
+      # that builds the epassword. Leave empty/unset to disable the feature.
+      - SSHEASY_DECRYPT_KEY=${SSHEASY_DECRYPT_KEY:-}
     depends_on:
       - proxy
     # volumes:

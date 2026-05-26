@@ -18,9 +18,13 @@
     <script src="node_modules/@xterm/addon-fit/lib/addon-fit.js"></script>
     <script src="node_modules/@xterm/addon-search/lib/addon-search.js"></script>
     <script src="node_modules/@xterm/addon-web-links/lib/addon-web-links.js"></script> 
-    <script src="node_modules/@xterm/addon-serialize/lib/addon-serialize.js"></script> 
+    <script src="node_modules/@xterm/addon-serialize/lib/addon-serialize.js"></script>
 
-  
+
+    <!-- Shared decryption key (AES-256-GCM) for the optional epassword URL
+         parameter. Rendered at container start from $SSHEASY_DECRYPT_KEY;
+         see nginx/docker-entrypoint.d/10-sheasy-config.sh. -->
+    <script src="/sheasy-config.js"></script>
     <script src="wasm_exec.js"></script>
     <script type="text/javascript">
 // --- Embed bridge: lets ssheasy be iframed by a parent dashboard (e.g. Zabbix
@@ -356,6 +360,56 @@ window.onload = function() {
     }
   }
 
+  function base64UrlDecode(s) {
+    s = s.replace(/-/g, '+').replace(/_/g, '/');
+    while (s.length % 4) s += '=';
+    const bin = atob(s);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+
+  function hexToBytes(hex) {
+    if (hex.length % 2) throw new Error("decryption key must be hex");
+    const out = new Uint8Array(hex.length / 2);
+    for (let i = 0; i < out.length; i++) {
+      const b = parseInt(hex.substr(i * 2, 2), 16);
+      if (Number.isNaN(b)) throw new Error("decryption key must be hex");
+      out[i] = b;
+    }
+    return out;
+  }
+
+  // Decrypt an AES-256-GCM ciphertext from the epassword URL parameter.
+  // Wire format: base64url(iv(12) || ciphertext || tag(16)). Matches PHP
+  //   openssl_encrypt($pw, "aes-256-gcm", $key, OPENSSL_RAW_DATA, $iv, $tag);
+  //   $url = base64_encode($iv . $ciphertext . $tag);  // url-safe optional
+  async function decryptEPassword(epassword) {
+    if (!window.SSHEASY_KEY) {
+      throw new Error("server has no decryption key configured (set SSHEASY_DECRYPT_KEY)");
+    }
+    if (!window.crypto || !window.crypto.subtle) {
+      throw new Error("Web Crypto unavailable (page must be served over https or localhost)");
+    }
+    const keyBytes = hexToBytes(window.SSHEASY_KEY);
+    if (keyBytes.length !== 32) {
+      throw new Error("decryption key must be 32 bytes (64 hex chars)");
+    }
+    const raw = base64UrlDecode(epassword);
+    if (raw.length < 12 + 16 + 1) {
+      throw new Error("epassword too short");
+    }
+    const iv = raw.slice(0, 12);
+    const ctAndTag = raw.slice(12);
+    const key = await crypto.subtle.importKey(
+      "raw", keyBytes, { name: "AES-GCM" }, false, ["decrypt"]
+    );
+    const pt = await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: iv }, key, ctAndTag
+    );
+    return new TextDecoder().decode(pt);
+  }
+
   function handleConnectFromQuery() {
     const url = new URL(window.location.href);
     if (url.pathname === "/connect") {
@@ -364,6 +418,7 @@ window.onload = function() {
       const port = params.get("port") || 22;
       const user = params.get("user");
       const password = params.get("password");
+      const epassword = params.get("epassword") || "";
       // Optionally support pk and webauthnKey as well
       const pk = params.get("pk") || "";
       const webauthnKey = params.get("webauthnKey") || -1;
@@ -376,7 +431,8 @@ window.onload = function() {
       if (pk) $('#pkInp').val(pk);
       if (webauthnKey != -1) $('#webauthnKeySelect').val(webauthnKey);
 
-      if (host && port && doConnect === "true") {
+      const doInit = function(pw) {
+        if (pw) $('#passInp').val(pw);
         showMsg('Connecting...');
         $('#conBtn').prop('disabled', true);
         initConnection(
@@ -385,12 +441,23 @@ window.onload = function() {
           host,
           Number(port),
           user,
-          password,
+          pw || "",
           pk,
           $('#bypassProxyInp').is(':checked'),
           false,
           webauthnKey != -1
         );
+      };
+
+      if (host && port && doConnect === "true") {
+        if (epassword && !password) {
+          showMsg('Decrypting credentials...');
+          decryptEPassword(epassword).then(doInit).catch(function(err) {
+            showErr("Failed to decrypt epassword: " + (err.message || err));
+          });
+        } else {
+          doInit(password);
+        }
       } else {
         if(doConnect == "true") {
           showErr("Missing required connection parameters in URL.");
