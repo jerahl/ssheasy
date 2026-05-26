@@ -37,6 +37,20 @@ Use `/connect?host=HOST&port=PORT&user=USER&password=PASSWORD` for initiating co
 
 ### Embedding ssheasy in another web app
 
+There are two ways to embed ssheasy in an iframe:
+
+1. **`/terminal` (recommended for embedding)** — a dedicated terminal-only page
+   that loads just xterm.js + the WASM SSH client. No jQuery, Bootstrap,
+   connection form, file browser, or modals. Accepts the same connection and
+   embed parameters and speaks the same postMessage protocol (below). The
+   fingerprint check and any missing user/password are handled with inline
+   terminal prompts. Example:
+   `/terminal?host=10.0.0.5&user=netops&embed=1&readonly=1&origin=https://zabbix.example.com`
+2. **`/connect?...&embed=1`** — the full index page with its chrome hidden via
+   CSS. Use this only if you also need the file browser/SFTP UI in the iframe.
+
+#### Full index page embed (`embed=1`)
+
 `embed=1` hides the navbar, connection form, file browser, history list, and
 footer so ssheasy fits inside an iframe. When the URL omits the `user` or
 `password`, ssheasy prompts for them directly in the terminal (password input
