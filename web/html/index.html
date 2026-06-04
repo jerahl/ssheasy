@@ -446,8 +446,10 @@ window.onload = function() {
             return;
           } else if (code === 127 || code === 8) { // Backspace / DEL
             if (buf.length > 0) {
+              // Always echo the erase even in masked mode; otherwise the
+              // displayed asterisk count drifts from the actual buffer length.
               buf = buf.slice(0, -1);
-              if (!opts.mask) term.write("\b \b");
+              term.write("\b \b");
             }
           } else if (code === 3) {                  // Ctrl-C
             term.write("^C\r\n");

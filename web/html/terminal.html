@@ -225,7 +225,10 @@
             if (ch === "\r" || ch === "\n") {
               term.write("\r\n"); disp.dispose(); resolve(buf); return;
             } else if (code === 127 || code === 8) {
-              if (buf.length > 0) { buf = buf.slice(0, -1); if (!opts.mask) term.write("\b \b"); }
+              // Backspace / DEL: echo "\b \b" even when masked so the user sees
+              // the asterisk get removed; the buffer length must match what's
+              // shown so the displayed and real lengths don't diverge.
+              if (buf.length > 0) { buf = buf.slice(0, -1); term.write("\b \b"); }
             } else if (code === 3) {
               term.write("^C\r\n"); disp.dispose(); resolve(null); return;
             } else if (code >= 32) {
@@ -246,10 +249,35 @@
       post({ type: "status", state: "connected", msg: status });
       if (initialCmd) setTimeout(function () { sshRun(initialCmd); }, 250);
     };
+    // localStorage-backed fingerprint store. Keyed by host so a previously
+    // accepted key auto-confirms on subsequent connects; mismatches warn loudly.
+    var FP_KEY = "ssheasy.fingerprints";
+    function getKnownFingerprints() {
+      try { return JSON.parse(localStorage.getItem(FP_KEY) || "{}"); }
+      catch (e) { return {}; }
+    }
+    function saveFingerprint(h, fp) {
+      try {
+        var m = getKnownFingerprints();
+        m[h] = fp;
+        localStorage.setItem(FP_KEY, JSON.stringify(m));
+        dbg("saved fingerprint for", h);
+      } catch (e) { dbg("save fingerprint failed:", e.message); }
+    }
+
+    // showErr is called by the WASM client on connection/auth failure. Offer
+    // an interactive retry so the operator can fix a typo without reloading.
+    var retrying = false;
     window.showErr = function (msg) {
       dbg("showErr:", msg);
       term.write("\r\n\x1b[31m" + msg + "\x1b[0m\r\n");
       post({ type: "status", state: "error", msg: msg });
+      if (retrying) return;
+      retrying = true;
+      termPrompt("Press Enter to try again (Ctrl-C to abort)...", {}).then(function (ans) {
+        retrying = false;
+        if (ans !== null) connect();
+      });
     };
     window.showReconnect = function (errMsg) {
       dbg("showReconnect:", errMsg);
@@ -265,10 +293,23 @@
       });
     };
     window.showServerKey = function (fp) {
-      dbg("showServerKey (fingerprint prompt):", fp);
+      dbg("showServerKey:", fp);
+      var known = getKnownFingerprints()[host];
+      if (known === fp) {
+        dbg("fingerprint matches saved entry; auto-accepting");
+        if (typeof window.acceptFingerprint === "function") window.acceptFingerprint(true);
+        return;
+      }
+      if (known && known !== fp) {
+        term.write("\r\n\x1b[31m!! HOST KEY CHANGED for " + host + " !!\x1b[0m\r\n");
+        term.write("Previously trusted: " + known + "\r\n");
+        term.write("Now presented:      " + fp + "\r\n");
+        term.write("\x1b[33mThis could be a MITM attack, or the device's key was legitimately rotated.\r\nVerify out-of-band before accepting.\x1b[0m\r\n");
+      }
       termPrompt("RSA key fingerprint is " + fp + "\r\nContinue connecting (yes/no)? ", {}).then(function (ans) {
         var ok = ans !== null && /^y(es)?$/i.test(ans.trim());
         dbg("fingerprint accepted:", ok);
+        if (ok) saveFingerprint(host, fp);
         if (typeof window.acceptFingerprint === "function") window.acceptFingerprint(ok);
         if (!ok) term.write("\x1b[31mHost key rejected.\x1b[0m\r\n");
       });
