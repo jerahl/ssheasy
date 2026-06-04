@@ -85,6 +85,12 @@
     var host = params.get("host");
     var port = params.get("port") || 22;
     var user = params.get("user");
+    // After a reload-on-disconnect, fall back to the last user typed for this
+    // host so the operator only re-enters the password, not the username.
+    if (!user && host) {
+      try { user = sessionStorage.getItem("ssheasy.user." + host) || null; }
+      catch (e) {}
+    }
     var password = params.get("password");
     var epassword = params.get("epassword") || "";
     var pk = params.get("pk") || "";
@@ -167,10 +173,15 @@
     });
 
     // --- resize ---
+    // Track WASM aliveness: the Go runtime is single-shot - once the SSH
+    // session ends, calling its js.Funcs throws "Go program has already
+    // exited" repeatedly. The flag stops the ResizeObserver from spamming.
+    var wasmAlive = true;
     var ro = new ResizeObserver(function () {
       fitAddon.fit();
-      if (connectedFlag && typeof window.changeWindowSize === "function") {
-        window.changeWindowSize(term.rows, term.cols);
+      if (connectedFlag && wasmAlive && typeof window.changeWindowSize === "function") {
+        try { window.changeWindowSize(term.rows, term.cols); }
+        catch (e) { dbg("changeWindowSize failed, disabling:", e.message); wasmAlive = false; }
       }
     });
     ro.observe(document.getElementById("terminal"));
@@ -283,13 +294,21 @@
       dbg("showReconnect:", errMsg);
       connectedFlag = false;
       keyCb = null;
+      wasmAlive = false; // session over - subsequent js.Func calls will throw
       if (reconnecting) return;
       reconnecting = true;
       post({ type: "status", state: "disconnected", msg: errMsg });
       term.write("\r\n\x1b[33mConnection closed: " + errMsg + "\x1b[0m\r\n");
       termPrompt("Press Enter to reconnect (Ctrl-C to abort)...", {}).then(function (ans) {
         reconnecting = false;
-        if (ans !== null) connect();
+        if (ans !== null) {
+          // ssheasy's WASM is single-shot: after the SSH session ends the Go
+          // runtime is gone. Reload the page to spin up a fresh WASM. The
+          // saved fingerprint (localStorage) and last user (sessionStorage)
+          // mean the operator only re-enters their password.
+          dbg("reloading page for fresh WASM");
+          window.location.reload();
+        }
       });
     };
     window.showServerKey = function (fp) {
@@ -334,6 +353,9 @@
         if (!u) {
           u = await termPrompt("login as: ", {});
           if (!u) { term.write("Login cancelled.\r\n"); return; }
+          // Remember within this browser tab so a reload-after-disconnect
+          // does not re-prompt for the username.
+          try { sessionStorage.setItem("ssheasy.user." + host, u); } catch (e) {}
         }
         var needPass = !pw && !pk;
         if (needPass) {
@@ -345,10 +367,18 @@
           return;
         }
         dbg("calling initConnection", { user: u, host: host, port: Number(port), hasPass: !!pw, hasPk: !!pk, bypassProxy: bypassProxy, bypassFingerprint: bypassFingerprint });
-        window.initConnection(
-          term.rows, term.cols, host, Number(port), u, pw || "", pk,
-          bypassProxy, bypassFingerprint, false
-        );
+        try {
+          window.initConnection(
+            term.rows, term.cols, host, Number(port), u, pw || "", pk,
+            bypassProxy, bypassFingerprint, false
+          );
+        } catch (e) {
+          // Most likely "Go program has already exited" - the WASM is dead.
+          // Reload to spin up a fresh runtime.
+          dbg("initConnection threw; reloading:", e.message);
+          term.write("\r\n\x1b[33mSSH client expired; reloading for a fresh session...\x1b[0m\r\n");
+          setTimeout(function () { window.location.reload(); }, 600);
+        }
       } catch (e) {
         window.showErr("connect() error: " + (e && (e.stack || e.message) || e));
       }
