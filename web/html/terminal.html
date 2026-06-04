@@ -316,7 +316,15 @@
       var known = getKnownFingerprints()[host];
       if (known === fp) {
         dbg("fingerprint matches saved entry; auto-accepting");
-        if (typeof window.acceptFingerprint === "function") window.acceptFingerprint(true);
+        // acceptFingerprint is a Go js.Func. Calling it synchronously inside
+        // this handler (which was itself invoked by Go via js.Value.Call)
+        // re-enters the Go runtime before the outer valueCall finishes
+        // reading its stack pointer, corrupting _inst.exports access in
+        // wasm_exec.js. Defer to a fresh JS task so Go's outbound call
+        // returns cleanly first.
+        setTimeout(function () {
+          if (typeof window.acceptFingerprint === "function") window.acceptFingerprint(true);
+        }, 0);
         return;
       }
       if (known && known !== fp) {
