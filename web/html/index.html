@@ -18,10 +18,190 @@
     <script src="node_modules/@xterm/addon-fit/lib/addon-fit.js"></script>
     <script src="node_modules/@xterm/addon-search/lib/addon-search.js"></script>
     <script src="node_modules/@xterm/addon-web-links/lib/addon-web-links.js"></script> 
-    <script src="node_modules/@xterm/addon-serialize/lib/addon-serialize.js"></script> 
+    <script src="node_modules/@xterm/addon-serialize/lib/addon-serialize.js"></script>
 
-  
+
+    <!-- Shared decryption key (AES-256-GCM) for the optional epassword URL
+         parameter. Rendered at container start from $SSHEASY_DECRYPT_KEY;
+         see nginx/docker-entrypoint.d/10-sheasy-config.sh. -->
+    <script src="/sheasy-config.js"></script>
     <script src="wasm_exec.js"></script>
+    <script type="text/javascript">
+// --- Embed bridge: lets ssheasy be iframed by a parent dashboard (e.g. Zabbix
+// switches "Macros · CLI" tab). Activated by the embed=1 URL parameter on
+// /connect. See README for the postMessage protocol.
+(function setupEmbedBridge() {
+  var url;
+  try { url = new URL(window.location.href); } catch (e) { return; }
+  if (url.pathname !== "/connect") return;
+  var p = url.searchParams;
+  var enabled = p.get("embed") === "1";
+  if (!enabled) return;
+
+  var allowedOrigin = p.get("origin") || "";
+  var readonly = p.get("readonly") === "1";
+  var debug = p.get("debug") === "1";
+  var initialCmd = "";
+  var initialCmdRaw = p.get("cmd") || "";
+  if (initialCmdRaw) {
+    try { initialCmd = atob(initialCmdRaw); }
+    catch (e) { console.warn("embed: invalid base64 cmd"); }
+  }
+
+  window.__embed = {
+    enabled: true,
+    readonly: readonly,
+    debug: debug,
+    origin: allowedOrigin,
+    initialCmd: initialCmd,
+    keyCb: null,
+  };
+  document.documentElement.classList.add("embed");
+
+  function post(msg) {
+    if (!allowedOrigin || !window.parent || window.parent === window) return;
+    try { window.parent.postMessage(msg, allowedOrigin); } catch (e) {}
+  }
+  window.__embed.post = post;
+
+  function dbg() {
+    if (!debug) return;
+    var args = Array.prototype.slice.call(arguments);
+    try { console.log.apply(console, ["[ssheasy-embed]"].concat(args)); } catch (e) {}
+    var msg = args.map(function (a) {
+      try { return typeof a === "object" ? JSON.stringify(a) : String(a); } catch (e) { return String(a); }
+    }).join(" ");
+    post({ type: "debug", msg: msg });
+  }
+  window.__embed.dbg = dbg;
+  dbg("embed bridge active:", {
+    readonly: readonly, origin: allowedOrigin || "(none)",
+    cmd: initialCmd || "(none)",
+    sheasyKey: (typeof window.SSHEASY_KEY === "undefined")
+      ? "(sheasy-config.js missing/404)"
+      : (window.SSHEASY_KEY ? "set" : "null")
+  });
+
+  // Wrap term.onData (called by the WASM client once we have an SSH session)
+  // so we can: capture the stdin-write callback, filter keystrokes in
+  // readonly mode, and replay commands sent via postMessage.
+  function wrapOnData() {
+    if (!window.term || typeof window.term.onData !== "function") return false;
+    if (window.term.__embedWrapped) return true;
+    var orig = window.term.onData.bind(window.term);
+    // Expose the unwrapped onData so pre-connection terminal prompts (login /
+    // password) can read input even when readonly mode is active.
+    window.__embed.rawOnData = orig;
+    window.term.onData = function(cb) {
+      window.__embed.keyCb = cb;
+      return orig(function(data) {
+        if (window.__embed.readonly) {
+          // Allow Ctrl-C only; drop everything else from the user.
+          if (data !== "\x03") return;
+        }
+        cb(data);
+      });
+    };
+    window.term.__embedWrapped = true;
+    return true;
+  }
+  // Try immediately and on a short interval until xterm exists.
+  if (!wrapOnData()) {
+    var iv = setInterval(function() { if (wrapOnData()) clearInterval(iv); }, 50);
+  }
+
+  // Programmatic command runner — bypasses the readonly filter.
+  window.sshRun = function(cmd) {
+    if (!window.__embed.keyCb) {
+      console.warn("embed: sshRun before SSH session is up");
+      return false;
+    }
+    if (!cmd.endsWith("\n") && !cmd.endsWith("\r")) cmd += "\n";
+    window.__embed.keyCb(cmd);
+    return true;
+  };
+
+  // Status reporting: wrap existing globals once they are defined.
+  function wrapStatus() {
+    if (typeof window.connected === "function" && !window.connected.__embedWrapped) {
+      var origConnected = window.connected;
+      window.connected = function(status, home) {
+        var r = origConnected.apply(this, arguments);
+        post({ type: "status", state: "connected", msg: status });
+        if (window.__embed.initialCmd) {
+          setTimeout(function() { window.sshRun(window.__embed.initialCmd); }, 250);
+        }
+        return r;
+      };
+      window.connected.__embedWrapped = true;
+    }
+    if (typeof window.showReconnect === "function" && !window.showReconnect.__embedWrapped) {
+      var origReconnect = window.showReconnect;
+      window.showReconnect = function(errMsg) {
+        post({ type: "status", state: "disconnected", msg: errMsg });
+        return origReconnect.apply(this, arguments);
+      };
+      window.showReconnect.__embedWrapped = true;
+    }
+    if (typeof window.showErr === "function" && !window.showErr.__embedWrapped) {
+      var origErr = window.showErr;
+      window.showErr = function(msg) {
+        post({ type: "status", state: "error", msg: msg });
+        return origErr.apply(this, arguments);
+      };
+      window.showErr.__embedWrapped = true;
+    }
+  }
+  var sIv = setInterval(function() {
+    wrapStatus();
+    if (window.connected && window.connected.__embedWrapped &&
+        window.showReconnect && window.showReconnect.__embedWrapped) {
+      clearInterval(sIv);
+    }
+  }, 50);
+
+  // Inbound postMessage handler.
+  window.addEventListener("message", function(ev) {
+    if (allowedOrigin && ev.origin !== allowedOrigin) {
+      dbg("ignored message from origin:", ev.origin, "(expected " + allowedOrigin + ")");
+      return;
+    }
+    var d = ev.data;
+    if (!d || typeof d !== "object") return;
+    dbg("message in:", d.type);
+    if (d.type === "run" && typeof d.cmd === "string") {
+      window.sshRun(d.cmd);
+    } else if (d.type === "interrupt") {
+      if (window.__embed.keyCb) window.__embed.keyCb("\x03");
+    } else if (d.type === "ping") {
+      post({ type: "pong" });
+    }
+  });
+
+  // Tell parent we are ready (it can then postMessage runs queued up).
+  document.addEventListener("DOMContentLoaded", function() {
+    post({ type: "status", state: "loaded" });
+  });
+})();
+    </script>
+    <style>
+      /* Embed mode: strip everything except the terminal. The parent
+         dashboard provides the surrounding chrome (tab nav, preset
+         command buttons, reconnect button, session timer). */
+      html.embed body { background: #000; }
+      html.embed #headerRow,
+      html.embed #footerRow,
+      html.embed #fileBrowserRow,
+      html.embed #historyListContainer,
+      html.embed #toggleFileBrowserBtn,
+      html.embed #conInf {
+        display: none !important;
+      }
+      /* Missing user/password are collected via terminal prompts (see
+         termPrompt), so the connection form is hidden entirely. */
+      html.embed #conPan { display: none !important; }
+      html.embed #mainContentArea { height: 100vh !important; }
+    </style>
     <script type="text/javascript">
 function fetchAndInstantiate(url, importObject) {
   return fetch(url).then(response =>
@@ -193,6 +373,98 @@ window.onload = function() {
     }
   }
 
+  function base64UrlDecode(s) {
+    s = s.replace(/-/g, '+').replace(/_/g, '/');
+    while (s.length % 4) s += '=';
+    const bin = atob(s);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+
+  function hexToBytes(hex) {
+    if (hex.length % 2) throw new Error("decryption key must be hex");
+    const out = new Uint8Array(hex.length / 2);
+    for (let i = 0; i < out.length; i++) {
+      const b = parseInt(hex.substr(i * 2, 2), 16);
+      if (Number.isNaN(b)) throw new Error("decryption key must be hex");
+      out[i] = b;
+    }
+    return out;
+  }
+
+  // Decrypt an AES-256-GCM ciphertext from the epassword URL parameter.
+  // Wire format: base64url(iv(12) || ciphertext || tag(16)). Matches PHP
+  //   openssl_encrypt($pw, "aes-256-gcm", $key, OPENSSL_RAW_DATA, $iv, $tag);
+  //   $url = base64_encode($iv . $ciphertext . $tag);  // url-safe optional
+  async function decryptEPassword(epassword) {
+    if (!window.SSHEASY_KEY) {
+      throw new Error("server has no decryption key configured (set SSHEASY_DECRYPT_KEY)");
+    }
+    if (!window.crypto || !window.crypto.subtle) {
+      throw new Error("Web Crypto unavailable (page must be served over https or localhost)");
+    }
+    const keyBytes = hexToBytes(window.SSHEASY_KEY);
+    if (keyBytes.length !== 32) {
+      throw new Error("decryption key must be 32 bytes (64 hex chars)");
+    }
+    const raw = base64UrlDecode(epassword);
+    if (raw.length < 12 + 16 + 1) {
+      throw new Error("epassword too short");
+    }
+    const iv = raw.slice(0, 12);
+    const ctAndTag = raw.slice(12);
+    const key = await crypto.subtle.importKey(
+      "raw", keyBytes, { name: "AES-GCM" }, false, ["decrypt"]
+    );
+    const pt = await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: iv }, key, ctAndTag
+    );
+    return new TextDecoder().decode(pt);
+  }
+
+  // Read a line of input directly from the xterm terminal. Returns the typed
+  // string on Enter, or null if the user pressed Ctrl-C. opts.mask hides input
+  // (for passwords). Uses the unwrapped onData so it works in readonly embeds.
+  function termPrompt(label, opts) {
+    opts = opts || {};
+    return new Promise(function(resolve) {
+      term.write("\r\n" + label);
+      term.focus();
+      var buf = "";
+      var register = (window.__embed && window.__embed.rawOnData)
+        ? window.__embed.rawOnData
+        : term.onData.bind(term);
+      var disp = register(function(data) {
+        for (var i = 0; i < data.length; i++) {
+          var ch = data[i];
+          var code = data.charCodeAt(i);
+          if (ch === "\r" || ch === "\n") {
+            term.write("\r\n");
+            disp.dispose();
+            resolve(buf);
+            return;
+          } else if (code === 127 || code === 8) { // Backspace / DEL
+            if (buf.length > 0) {
+              // Always echo the erase even in masked mode; otherwise the
+              // displayed asterisk count drifts from the actual buffer length.
+              buf = buf.slice(0, -1);
+              term.write("\b \b");
+            }
+          } else if (code === 3) {                  // Ctrl-C
+            term.write("^C\r\n");
+            disp.dispose();
+            resolve(null);
+            return;
+          } else if (code >= 32) {                  // printable
+            buf += ch;
+            term.write(opts.mask ? "*" : ch);
+          }
+        }
+      });
+    });
+  }
+
   function handleConnectFromQuery() {
     const url = new URL(window.location.href);
     if (url.pathname === "/connect") {
@@ -201,6 +473,7 @@ window.onload = function() {
       const port = params.get("port") || 22;
       const user = params.get("user");
       const password = params.get("password");
+      const epassword = params.get("epassword") || "";
       // Optionally support pk and webauthnKey as well
       const pk = params.get("pk") || "";
       const webauthnKey = params.get("webauthnKey") || -1;
@@ -213,7 +486,26 @@ window.onload = function() {
       if (pk) $('#pkInp').val(pk);
       if (webauthnKey != -1) $('#webauthnKeySelect').val(webauthnKey);
 
-      if (host && port && doConnect === "true") {
+      // Prompt in the terminal for any missing user/password, then connect.
+      const collectAndConnect = async function(pw) {
+        let u = user;
+        let p = pw;
+        const needUser = !u;
+        const needPass = !p && !pk && webauthnKey == -1;
+        if (needUser || needPass) {
+          term.reset();
+          term.write("Connecting to " + host + "...\r\n");
+        }
+        if (needUser) {
+          u = await termPrompt("login as: ", {});
+          if (!u) { showErr("Login cancelled."); return; }
+          $('#usrInp').val(u);
+        }
+        if (needPass) {
+          p = await termPrompt(u + "@" + host + "'s password: ", { mask: true });
+          if (p === null) { showErr("Login cancelled."); return; }
+        }
+        if (p) $('#passInp').val(p);
         showMsg('Connecting...');
         $('#conBtn').prop('disabled', true);
         initConnection(
@@ -221,13 +513,26 @@ window.onload = function() {
           term.cols,
           host,
           Number(port),
-          user,
-          password,
+          u,
+          p || "",
           pk,
           $('#bypassProxyInp').is(':checked'),
           false,
           webauthnKey != -1
         );
+      };
+
+      if (host && port && doConnect === "true") {
+        if (epassword && !password) {
+          showMsg('Decrypting credentials...');
+          decryptEPassword(epassword).then(function(pw) {
+            collectAndConnect(pw);
+          }).catch(function(err) {
+            showErr("Failed to decrypt epassword: " + (err.message || err));
+          });
+        } else {
+          collectAndConnect(password);
+        }
       } else {
         if(doConnect == "true") {
           showErr("Missing required connection parameters in URL.");

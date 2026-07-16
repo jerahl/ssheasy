@@ -25,10 +25,116 @@ Use `/connect?host=HOST&port=PORT&user=USER&password=PASSWORD` for initiating co
 | `pk`           | Private key (as string, for key auth)       | –            |
 | `webauthnKey`  | WebAuthn key ID (for WebAuthn auth)         | -1           |
 | `connect`      | Whether to auto-connect (`"true"`/`"false"`) | "true"      |
+| `embed`        | Embed mode (`"1"` strips chrome for iframing) | -          |
+| `readonly`     | Drop user keystrokes except Ctrl-C (`"1"`)  | -            |
+| `origin`       | Allowed parent origin for postMessage       | -            |
+| `cmd`          | Base64-encoded command to run on connect    | -            |
+| `epassword`    | AES-256-GCM encrypted password (see below)  | -            |
+| `debug`        | `"1"` logs to console / screen / postMessage | -           |
 
 *Notes:*
 - `host` is mandatory if `connect` is `"true"` (or not provided).
 - If `connect` is `"false"`, the connection will not auto-initiate, but the provided connection data will be filled in the connection form.
+
+### Embedding ssheasy in another web app
+
+There are two ways to embed ssheasy in an iframe:
+
+1. **`/terminal` (recommended for embedding)** — a dedicated terminal-only page
+   that loads just xterm.js + the WASM SSH client. No jQuery, Bootstrap,
+   connection form, file browser, or modals. Accepts the same connection and
+   embed parameters and speaks the same postMessage protocol (below). The
+   fingerprint check and any missing user/password are handled with inline
+   terminal prompts. Example:
+   `/terminal?host=10.0.0.5&user=netops&embed=1&readonly=1&origin=https://zabbix.example.com`
+2. **`/connect?...&embed=1`** — the full index page with its chrome hidden via
+   CSS. Use this only if you also need the file browser/SFTP UI in the iframe.
+
+> **Note:** `terminal.html`, `sheasy-config.js`, and the nginx changes are
+> baked into the web image at build time. After pulling these changes you must
+> rebuild, e.g. `docker-compose up --build` (a plain restart serves the old
+> image and `/terminal` + `/sheasy-config.js` will 404).
+
+#### Debugging
+
+Add `debug=1` to either embed URL to trace startup. It logs (with a
+`[ssheasy]` prefix) to the browser console, draws dim `[dbg]` lines in the
+terminal itself, and — when `origin` is set — posts `{type:"debug", msg}` to
+the parent window. It reports parsed parameters, whether `xterm`/`wasm_exec`/
+`sheasy-config.js` loaded, the `/main.wasm` fetch status, each WASM callback
+(`connected`, `showErr`, `showReconnect`, fingerprint prompt), and every
+inbound/outbound postMessage. If the iframe is blank, a fatal startup error is
+also written to a visible `<pre>` so you see it without opening devtools.
+
+#### Full index page embed (`embed=1`)
+
+`embed=1` hides the navbar, connection form, file browser, history list, and
+footer so ssheasy fits inside an iframe. When the URL omits the `user` or
+`password`, ssheasy prompts for them directly in the terminal (password input
+is masked, Ctrl-C cancels) — useful when the parent app supplies the host from
+context but not the secret. This terminal prompting also works outside embed
+mode for any `/connect` URL with a blank user or password.
+
+Set `origin` to the parent window's origin to enable a postMessage bridge:
+
+| Direction         | Message                                     | Meaning |
+|-------------------|---------------------------------------------|---------|
+| iframe → parent   | `{type:"status", state:"loaded"}`           | Page loaded, ready for messages |
+| iframe → parent   | `{type:"status", state:"connected", msg}`   | SSH session is up |
+| iframe → parent   | `{type:"status", state:"disconnected", msg}`| Connection dropped |
+| iframe → parent   | `{type:"status", state:"error", msg}`       | Error shown to user |
+| iframe → parent   | `{type:"pong"}`                             | Reply to a `ping` |
+| parent → iframe   | `{type:"run", cmd:"show version"}`          | Run command (bypasses `readonly`) |
+| parent → iframe   | `{type:"interrupt"}`                        | Send Ctrl-C |
+| parent → iframe   | `{type:"ping"}`                             | Liveness check |
+
+Messages from origins other than `origin` are ignored. Configure nginx
+`frame-ancestors` (see `nginx/nginx.conf`) so browsers will only embed
+ssheasy from the parent app's origin.
+
+### Encrypted password parameter (`epassword`)
+
+Putting a plaintext `password=` in the URL leaks it to browser history,
+referrer headers, server logs, and screenshots. `epassword` accepts an
+AES-256-GCM ciphertext instead. Both ssheasy and the parent app share a
+32-byte symmetric key; the URL only contains the ciphertext.
+
+**Threat model:** this protects against URL leakage. It does **not**
+protect against an attacker who can fetch `/sheasy-config.js` from
+ssheasy's origin — the key is served to the browser so the WASM client
+can decrypt. Pair with `nginx` access controls and `frame-ancestors`.
+
+**Setup:**
+
+1. Generate a key once and store it in both places:
+   ```
+   openssl rand -hex 32
+   ```
+2. Set `SSHEASY_DECRYPT_KEY` on the ssheasy `web` container (see
+   `docker-compose.yaml`). The entrypoint writes it to
+   `/usr/share/nginx/html/sheasy-config.js` on container start.
+3. Configure the same key on the parent app side.
+
+**Wire format:** `epassword = base64( iv(12 bytes) || ciphertext || tag(16 bytes) )`.
+Standard or URL-safe base64 both work.
+
+**PHP (Zabbix side):**
+```php
+$key = hex2bin(getenv('SSHEASY_DECRYPT_KEY')); // 32 raw bytes
+$iv  = random_bytes(12);
+$tag = '';
+$ct  = openssl_encrypt(
+    $password, 'aes-256-gcm', $key, OPENSSL_RAW_DATA, $iv, $tag
+);
+$epassword = rtrim(strtr(base64_encode($iv . $ct . $tag), '+/', '-_'), '=');
+$url = "/connect?host=$host&user=$user&epassword=$epassword&embed=1";
+```
+
+**Browser side:** ssheasy decodes the parameter, splits off the IV and
+tag, and decrypts via `crypto.subtle.decrypt({name:'AES-GCM', iv}, ...)`
+before calling `initConnection`. If `SSHEASY_DECRYPT_KEY` is unset or
+decryption fails, the user sees an error and the connection is not
+attempted.
 
 
 ## Testing

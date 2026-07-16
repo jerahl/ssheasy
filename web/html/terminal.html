@@ -1,0 +1,425 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>SSH Terminal</title>
+    <link rel="stylesheet" href="node_modules/@xterm/xterm/css/xterm.css" />
+    <style>
+      html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+      #terminal { position: absolute; inset: 0; padding: 4px; box-sizing: border-box; }
+    </style>
+    <script src="node_modules/@xterm/xterm/lib/xterm.js"></script>
+    <script src="node_modules/@xterm/addon-fit/lib/addon-fit.js"></script>
+    <script src="node_modules/@xterm/addon-web-links/lib/addon-web-links.js"></script>
+    <!-- Shared AES-GCM key for the optional epassword parameter -->
+    <script src="/sheasy-config.js" onerror="window.__sheasyConfigError=true"></script>
+    <script src="wasm_exec.js"></script>
+  </head>
+  <body>
+    <div id="terminal"></div>
+    <pre id="bootError" style="color:#f55;font:12px monospace;padding:8px;white-space:pre-wrap;display:none"></pre>
+    <script>
+// Minimal terminal-only SSH page for embedding (e.g. the Zabbix switches
+// "Macros . CLI" tab). It reuses the same main.wasm SSH client as index.html
+// but drops the connection form, file browser, modals, jQuery and Bootstrap.
+//
+// URL parameters (all optional except host):
+//   host, port, user, password, pk   - connection details
+//   epassword                        - AES-256-GCM password (see README)
+//   readonly=1                       - drop typed input except Ctrl-C
+//   origin=<parent-origin>           - enable postMessage bridge
+//   cmd=<base64>                     - command to run once connected
+//   debug=1                          - verbose logging (console + on-screen)
+//   bypassProxy=1, bypassFingerprint=1
+//
+// postMessage protocol (when origin is set) mirrors index.html embed mode:
+//   iframe -> parent: {type:"status", state:"loaded|connected|disconnected|error", msg}
+//                     {type:"debug", msg} | {type:"pong"}
+//   parent -> iframe: {type:"run", cmd} | {type:"interrupt"} | {type:"ping"}
+(function () {
+  var params = new URLSearchParams(window.location.search);
+  var debug = params.get("debug") === "1";
+  var allowedOrigin = params.get("origin") || "";
+
+  // Logging that works before xterm exists. Falls back to a <pre> if even the
+  // terminal failed to initialise, so a blank iframe always shows *something*.
+  var termRef = null;
+  function rawPost(msg) {
+    if (!allowedOrigin || window.parent === window) return;
+    try { window.parent.postMessage(msg, allowedOrigin); } catch (e) {}
+  }
+  function dbg() {
+    var args = Array.prototype.slice.call(arguments);
+    try { console.log.apply(console, ["[ssheasy]"].concat(args)); } catch (e) {}
+    var msg = args.map(function (a) {
+      try { return typeof a === "object" ? JSON.stringify(a) : String(a); }
+      catch (e) { return String(a); }
+    }).join(" ");
+    if (debug) {
+      if (termRef) { try { termRef.write("\x1b[90m[dbg] " + msg + "\x1b[0m\r\n"); } catch (e) {} }
+      rawPost({ type: "debug", msg: msg });
+    }
+  }
+  function fatal(msg) {
+    dbg("FATAL:", msg);
+    rawPost({ type: "status", state: "error", msg: msg });
+    if (termRef) { try { termRef.write("\r\n\x1b[31m" + msg + "\x1b[0m\r\n"); return; } catch (e) {} }
+    var pre = document.getElementById("bootError");
+    if (pre) { pre.style.display = "block"; pre.textContent = "[ssheasy] " + msg; }
+  }
+
+  window.addEventListener("error", function (e) {
+    dbg("window error:", e.message, "@", (e.filename || "?") + ":" + (e.lineno || "?"));
+  });
+  window.addEventListener("unhandledrejection", function (e) {
+    dbg("unhandled rejection:", e.reason && (e.reason.message || e.reason));
+  });
+
+  try {
+    boot();
+  } catch (e) {
+    fatal("boot failed: " + (e && (e.stack || e.message) || e));
+  }
+
+  function boot() {
+    var host = params.get("host");
+    var port = params.get("port") || 22;
+    var user = params.get("user");
+    // After a reload-on-disconnect, fall back to the last user typed for this
+    // host so the operator only re-enters the password, not the username.
+    if (!user && host) {
+      try { user = sessionStorage.getItem("ssheasy.user." + host) || null; }
+      catch (e) {}
+    }
+    var password = params.get("password");
+    var epassword = params.get("epassword") || "";
+    var pk = params.get("pk") || "";
+    var readonly = params.get("readonly") === "1";
+    var bypassProxy = params.get("bypassProxy") === "1";
+    var bypassFingerprint = params.get("bypassFingerprint") === "1";
+    var initialCmd = "";
+    if (params.get("cmd")) {
+      try { initialCmd = atob(params.get("cmd")); }
+      catch (e) { dbg("invalid base64 cmd:", e.message); }
+    }
+
+    dbg("boot; params:", {
+      host: host, port: port, user: user || "(prompt)",
+      hasPassword: !!password, hasEpassword: !!epassword, hasPk: !!pk,
+      readonly: readonly, origin: allowedOrigin || "(none)",
+      bypassProxy: bypassProxy, bypassFingerprint: bypassFingerprint,
+      cmd: initialCmd ? initialCmd : "(none)"
+    });
+    dbg("globals:", {
+      Terminal: typeof Terminal, FitAddon: typeof FitAddon,
+      WebLinksAddon: typeof WebLinksAddon, Go: typeof Go,
+      sheasyKey: (typeof window.SSHEASY_KEY === "undefined")
+        ? "(sheasy-config.js missing/404)"
+        : (window.SSHEASY_KEY ? "set" : "null"),
+      crypto: !!(window.crypto && window.crypto.subtle)
+    });
+    if (window.__sheasyConfigError) dbg("WARNING: /sheasy-config.js failed to load (404?) - epassword will not work");
+    if (typeof Terminal === "undefined") { fatal("xterm.js did not load (node_modules path wrong?)"); return; }
+    if (typeof Go === "undefined") { fatal("wasm_exec.js did not load"); return; }
+
+    // --- xterm setup ---
+    var term = new Terminal({ cursorBlink: true, fontSize: 13 });
+    termRef = term;
+    var fitAddon = new FitAddon.FitAddon();
+    term.loadAddon(fitAddon);
+    if (typeof WebLinksAddon !== "undefined") term.loadAddon(new WebLinksAddon.WebLinksAddon());
+    term.open(document.getElementById("terminal"));
+    fitAddon.fit();
+    window.term = term; // main.wasm reads this global
+    dbg("xterm initialised:", term.rows + "x" + term.cols);
+
+    var keyCb = null;          // SSH stdin writer, captured when WASM registers it
+    var connectedFlag = false;
+    var reconnecting = false;
+
+    // Wrap onData so we can capture the WASM-registered stdin writer, enforce
+    // readonly mode, and expose a raw (unfiltered) registrar for prompts.
+    var rawOnData = term.onData.bind(term);
+    term.onData = function (cb) {
+      dbg("WASM registered onData (SSH session stdin)");
+      keyCb = cb;
+      return rawOnData(function (data) {
+        if (readonly && data !== "\x03") return; // allow Ctrl-C only
+        cb(data);
+      });
+    };
+
+    // --- postMessage bridge ---
+    function post(msg) { rawPost(msg); }
+    function sshRun(cmd) {
+      if (!keyCb) { dbg("sshRun ignored - no SSH session yet:", cmd); return false; }
+      if (!cmd.endsWith("\n") && !cmd.endsWith("\r")) cmd += "\n";
+      dbg("sshRun:", JSON.stringify(cmd));
+      keyCb(cmd);
+      return true;
+    }
+    window.sshRun = sshRun;
+    window.addEventListener("message", function (ev) {
+      if (allowedOrigin && ev.origin !== allowedOrigin) {
+        dbg("ignored message from origin:", ev.origin, "(expected " + allowedOrigin + ")");
+        return;
+      }
+      var d = ev.data;
+      if (!d || typeof d !== "object") return;
+      dbg("message in:", d.type);
+      if (d.type === "run" && typeof d.cmd === "string") sshRun(d.cmd);
+      else if (d.type === "interrupt") { if (keyCb) keyCb("\x03"); }
+      else if (d.type === "ping") post({ type: "pong" });
+    });
+
+    // --- resize ---
+    // Track WASM aliveness: the Go runtime is single-shot - once the SSH
+    // session ends, calling its js.Funcs throws "Go program has already
+    // exited" repeatedly. The flag stops the ResizeObserver from spamming.
+    var wasmAlive = true;
+    var ro = new ResizeObserver(function () {
+      fitAddon.fit();
+      if (connectedFlag && wasmAlive && typeof window.changeWindowSize === "function") {
+        try { window.changeWindowSize(term.rows, term.cols); }
+        catch (e) { dbg("changeWindowSize failed, disabling:", e.message); wasmAlive = false; }
+      }
+    });
+    ro.observe(document.getElementById("terminal"));
+
+    // --- crypto helpers (AES-256-GCM epassword) ---
+    function base64UrlDecode(s) {
+      s = s.replace(/-/g, "+").replace(/_/g, "/");
+      while (s.length % 4) s += "=";
+      var bin = atob(s);
+      var out = new Uint8Array(bin.length);
+      for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+      return out;
+    }
+    function hexToBytes(hex) {
+      if (hex.length % 2) throw new Error("decryption key must be hex");
+      var out = new Uint8Array(hex.length / 2);
+      for (var i = 0; i < out.length; i++) {
+        var b = parseInt(hex.substr(i * 2, 2), 16);
+        if (Number.isNaN(b)) throw new Error("decryption key must be hex");
+        out[i] = b;
+      }
+      return out;
+    }
+    async function decryptEPassword(ep) {
+      dbg("decrypting epassword (len " + ep.length + ")");
+      if (!window.SSHEASY_KEY) throw new Error("server has no decryption key configured (set SSHEASY_DECRYPT_KEY and rebuild the web image)");
+      if (!window.crypto || !window.crypto.subtle) throw new Error("Web Crypto unavailable (serve over https or localhost)");
+      var keyBytes = hexToBytes(window.SSHEASY_KEY);
+      if (keyBytes.length !== 32) throw new Error("decryption key must be 32 bytes (64 hex chars)");
+      var raw = base64UrlDecode(ep);
+      if (raw.length < 12 + 16 + 1) throw new Error("epassword too short");
+      var iv = raw.slice(0, 12);
+      var ctAndTag = raw.slice(12);
+      var key = await crypto.subtle.importKey("raw", keyBytes, { name: "AES-GCM" }, false, ["decrypt"]);
+      var ptBuf = await crypto.subtle.decrypt({ name: "AES-GCM", iv: iv }, key, ctAndTag);
+      dbg("epassword decrypted OK");
+      return new TextDecoder().decode(ptBuf);
+    }
+
+    // --- terminal line prompt (login / password / fingerprint) ---
+    function termPrompt(label, opts) {
+      opts = opts || {};
+      dbg("prompt:", JSON.stringify(label.trim()), opts.mask ? "(masked)" : "");
+      return new Promise(function (resolve) {
+        term.write("\r\n" + label);
+        term.focus();
+        var buf = "";
+        var disp = rawOnData(function (data) {
+          for (var i = 0; i < data.length; i++) {
+            var ch = data[i];
+            var code = data.charCodeAt(i);
+            if (ch === "\r" || ch === "\n") {
+              term.write("\r\n"); disp.dispose(); resolve(buf); return;
+            } else if (code === 127 || code === 8) {
+              // Backspace / DEL: echo "\b \b" even when masked so the user sees
+              // the asterisk get removed; the buffer length must match what's
+              // shown so the displayed and real lengths don't diverge.
+              if (buf.length > 0) { buf = buf.slice(0, -1); term.write("\b \b"); }
+            } else if (code === 3) {
+              term.write("^C\r\n"); disp.dispose(); resolve(null); return;
+            } else if (code >= 32) {
+              buf += ch; term.write(opts.mask ? "*" : ch);
+            }
+          }
+        });
+      });
+    }
+
+    // --- callbacks invoked by main.wasm ---
+    window.connected = function (status, home) {
+      dbg("connected callback:", status, "home=" + home);
+      connectedFlag = true;
+      reconnecting = false;
+      term.focus();
+      if (typeof window.changeWindowSize === "function") window.changeWindowSize(term.rows, term.cols);
+      post({ type: "status", state: "connected", msg: status });
+      if (initialCmd) setTimeout(function () { sshRun(initialCmd); }, 250);
+    };
+    // localStorage-backed fingerprint store. Keyed by host so a previously
+    // accepted key auto-confirms on subsequent connects; mismatches warn loudly.
+    var FP_KEY = "ssheasy.fingerprints";
+    function getKnownFingerprints() {
+      try { return JSON.parse(localStorage.getItem(FP_KEY) || "{}"); }
+      catch (e) { return {}; }
+    }
+    function saveFingerprint(h, fp) {
+      try {
+        var m = getKnownFingerprints();
+        m[h] = fp;
+        localStorage.setItem(FP_KEY, JSON.stringify(m));
+        dbg("saved fingerprint for", h);
+      } catch (e) { dbg("save fingerprint failed:", e.message); }
+    }
+
+    // showErr is called by the WASM client on connection/auth failure. Offer
+    // an interactive retry so the operator can fix a typo without reloading.
+    var retrying = false;
+    window.showErr = function (msg) {
+      dbg("showErr:", msg);
+      term.write("\r\n\x1b[31m" + msg + "\x1b[0m\r\n");
+      post({ type: "status", state: "error", msg: msg });
+      if (retrying) return;
+      retrying = true;
+      termPrompt("Press Enter to try again (Ctrl-C to abort)...", {}).then(function (ans) {
+        retrying = false;
+        if (ans !== null) connect();
+      });
+    };
+    window.showReconnect = function (errMsg) {
+      dbg("showReconnect:", errMsg);
+      connectedFlag = false;
+      keyCb = null;
+      wasmAlive = false; // session over - subsequent js.Func calls will throw
+      if (reconnecting) return;
+      reconnecting = true;
+      post({ type: "status", state: "disconnected", msg: errMsg });
+      term.write("\r\n\x1b[33mConnection closed: " + errMsg + "\x1b[0m\r\n");
+      termPrompt("Press Enter to reconnect (Ctrl-C to abort)...", {}).then(function (ans) {
+        reconnecting = false;
+        if (ans !== null) {
+          // ssheasy's WASM is single-shot: after the SSH session ends the Go
+          // runtime is gone. Reload the page to spin up a fresh WASM. The
+          // saved fingerprint (localStorage) and last user (sessionStorage)
+          // mean the operator only re-enters their password.
+          dbg("reloading page for fresh WASM");
+          window.location.reload();
+        }
+      });
+    };
+    window.showServerKey = function (fp) {
+      dbg("showServerKey:", fp);
+      var known = getKnownFingerprints()[host];
+      if (known === fp) {
+        dbg("fingerprint matches saved entry; auto-accepting");
+        // acceptFingerprint is a Go js.Func. Calling it synchronously inside
+        // this handler (which was itself invoked by Go via js.Value.Call)
+        // re-enters the Go runtime before the outer valueCall finishes
+        // reading its stack pointer, corrupting _inst.exports access in
+        // wasm_exec.js. Defer to a fresh JS task so Go's outbound call
+        // returns cleanly first.
+        setTimeout(function () {
+          if (typeof window.acceptFingerprint === "function") window.acceptFingerprint(true);
+        }, 0);
+        return;
+      }
+      if (known && known !== fp) {
+        term.write("\r\n\x1b[31m!! HOST KEY CHANGED for " + host + " !!\x1b[0m\r\n");
+        term.write("Previously trusted: " + known + "\r\n");
+        term.write("Now presented:      " + fp + "\r\n");
+        term.write("\x1b[33mThis could be a MITM attack, or the device's key was legitimately rotated.\r\nVerify out-of-band before accepting.\x1b[0m\r\n");
+      }
+      termPrompt("RSA key fingerprint is " + fp + "\r\nContinue connecting (yes/no)? ", {}).then(function (ans) {
+        var ok = ans !== null && /^y(es)?$/i.test(ans.trim());
+        dbg("fingerprint accepted:", ok);
+        if (ok) saveFingerprint(host, fp);
+        if (typeof window.acceptFingerprint === "function") window.acceptFingerprint(ok);
+        if (!ok) term.write("\x1b[31mHost key rejected.\x1b[0m\r\n");
+      });
+    };
+    // This page does not support WebAuthn; provide safe stubs in case they are
+    // reached (they are only called when useWebauthn is true, which we never set).
+    window.getSelectedWebauthnKey = function () { return null; };
+    window.retrievePublicKey = function () { return Promise.reject("webauthn not supported in terminal view"); };
+
+    // --- connection flow ---
+    async function connect() {
+      try {
+        if (!host) { window.showErr("Missing required 'host' parameter."); return; }
+        var pw = password;
+        if (epassword && !password) {
+          term.write("Decrypting credentials...\r\n");
+          try { pw = await decryptEPassword(epassword); }
+          catch (e) { window.showErr("Failed to decrypt epassword: " + (e.message || e)); return; }
+        }
+        var u = user;
+        term.write("Connecting to " + host + " ...\r\n");
+        if (!u) {
+          u = await termPrompt("login as: ", {});
+          if (!u) { term.write("Login cancelled.\r\n"); return; }
+          // Remember within this browser tab so a reload-after-disconnect
+          // does not re-prompt for the username.
+          try { sessionStorage.setItem("ssheasy.user." + host, u); } catch (e) {}
+        }
+        var needPass = !pw && !pk;
+        if (needPass) {
+          pw = await termPrompt(u + "@" + host + "'s password: ", { mask: true });
+          if (pw === null) { term.write("Login cancelled.\r\n"); return; }
+        }
+        if (typeof window.initConnection !== "function") {
+          window.showErr("SSH client not ready (initConnection undefined) - WASM failed to start.");
+          return;
+        }
+        dbg("calling initConnection", { user: u, host: host, port: Number(port), hasPass: !!pw, hasPk: !!pk, bypassProxy: bypassProxy, bypassFingerprint: bypassFingerprint });
+        try {
+          window.initConnection(
+            term.rows, term.cols, host, Number(port), u, pw || "", pk,
+            bypassProxy, bypassFingerprint, false
+          );
+        } catch (e) {
+          // Most likely "Go program has already exited" - the WASM is dead.
+          // Reload to spin up a fresh runtime.
+          dbg("initConnection threw; reloading:", e.message);
+          term.write("\r\n\x1b[33mSSH client expired; reloading for a fresh session...\x1b[0m\r\n");
+          setTimeout(function () { window.location.reload(); }, 600);
+        }
+      } catch (e) {
+        window.showErr("connect() error: " + (e && (e.stack || e.message) || e));
+      }
+    }
+    window.__terminalConnect = connect;
+
+    post({ type: "status", state: "loaded" });
+    dbg("posted loaded; fetching /main.wasm");
+
+    // --- boot the WASM SSH client, then connect ---
+    var go = new Go();
+    fetch("/main.wasm")
+      .then(function (r) {
+        dbg("/main.wasm response:", r.status, r.headers.get("content-type"));
+        if (!r.ok) throw new Error("/main.wasm returned HTTP " + r.status);
+        return r.arrayBuffer();
+      })
+      .then(function (bytes) {
+        dbg("/main.wasm bytes:", bytes.byteLength);
+        return WebAssembly.instantiate(bytes, go.importObject);
+      })
+      .then(function (res) {
+        dbg("WASM instantiated; running");
+        go.run(res.instance); // registers initConnection, acceptFingerprint, ...
+        dbg("go.run returned; initConnection is " + typeof window.initConnection);
+        connect();
+      })
+      .catch(function (e) {
+        fatal("Failed to load SSH client: " + (e && (e.message || e)));
+      });
+  }
+})();
+    </script>
+  </body>
+</html>
+
